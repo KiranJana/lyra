@@ -1,0 +1,488 @@
+Project Lyra: Architecture & Implementation Guide
+Executive Summary
+Project Lyra aims to replicate the core functionality of Musi—a free music streaming app that leverages YouTube's music catalog—while establishing a modern, extensible architecture that enables future enhancements. This guide provides concrete technical decisions, architecture patterns, and implementation strategies based on current 2024-2025 best practices.
+
+Part 1: Understanding the Core Problem
+What Musi Actually Does
+Musi is fundamentally a YouTube audio streaming wrapper with three key capabilities:
+
+Search: Uses YouTube's infrastructure to find music content
+Background Playback: Streams audio while the app is minimized or screen is locked
+Playlist Management: Stores user-created playlists locally on device
+Musi does NOT download content—it streams in real-time, which is the legal distinction that has kept it on the App Store for 10+ years. Your app must maintain this same approach.
+
+Legal Boundaries (Non-Negotiable)
+Allowed	Not Allowed
+Streaming audio in real-time	Downloading audio/video files
+Background playback	Caching full tracks offline
+Local playlist metadata storage	Storing copyrighted content
+Using official YouTube API for search	Bypassing YouTube's content restrictions
+Part 2: Recommended Tech Stack
+Mobile Framework: Flutter (Recommended)
+After analyzing current 2024-2025 trends, Flutter emerges as the stronger choice for this specific use case:
+
+Why Flutter over React Native:
+
+Performance: Flutter compiles directly to native ARM code via Ahead-of-Time (AOT) compilation, eliminating the JavaScript bridge latency present in React Native
+Audio Performance: Critical for a music app—Flutter's direct native compilation means smoother audio handling, especially during background playback
+Custom UI: Flutter's widget-based rendering engine gives you complete control over every pixel, enabling the "glassmorphic" design aesthetic you mentioned
+Single Codebase: 95%+ code sharing between iOS and Android
+Growing Ecosystem: 170,000+ GitHub stars, 46% market share among cross-platform frameworks (2025)
+Language: Dart (optimized for UI performance, garbage collection tuned for smooth 60fps)
+
+Local Database: Drift (SQLite-based)
+After evaluating Hive, Isar, sqflite, and ObjectBox:
+
+Why Drift:
+
+Actively Maintained: Unlike Hive and Isar (both abandoned by original authors, now community forks)
+Type Safety: Compile-time query validation prevents runtime errors
+Relational Data: Perfect for playlists → tracks relationships
+Migration Support: Built-in schema versioning for app updates
+SQL Power: Full SQL capabilities when needed, ORM convenience for simple queries
+Schema Concept:
+
+Playlists (id, name, created_at, updated_at, cover_art_url)
+    ↓ has many
+Tracks (id, playlist_id, youtube_id, title, artist, thumbnail_url, duration, position)
+Backend Service: Supabase (Recommended)
+For user accounts, sync, and social features:
+
+Why Supabase over Firebase:
+
+PostgreSQL Foundation: Relational database with full SQL—ideal for playlist/track relationships
+Open Source: No vendor lock-in, self-hosting option available
+Predictable Pricing: Flat tier pricing vs Firebase's per-operation billing surprises
+Row Level Security (RLS): SQL-based access control integrates naturally with your data model
+Real-time: Built-in WebSocket subscriptions for "Party Mode" feature
+Edge Functions: TypeScript serverless functions on Deno runtime
+What Supabase Handles:
+
+User authentication (email, Google, Apple Sign-In)
+Cloud playlist sync across devices
+Social features (following, shared playlists)
+Analytics and user metrics
+Audio Engine: just_audio + just_audio_background
+The de facto standard for Flutter audio streaming:
+
+Core Package: just_audio
+
+Gapless playback support
+Buffer management and pre-loading
+Streaming URL playback
+Equalizer integration
+Loop and shuffle modes
+Background Package: just_audio_background
+
+Lock screen controls (play/pause/skip)
+Media notification with artwork
+Headset/Bluetooth controls
+CarPlay and Android Auto integration
+Apple Watch controls
+Media Extraction Layer: Self-Hosted Piped or Invidious Instance
+The Critical Decision:
+
+You have three options for extracting playable audio stream URLs from YouTube:
+
+Option	Pros	Cons
+YouTube Data API v3	Official, legal, reliable	10,000 units/day quota; search costs 100 units each; NO stream URLs
+Piped Instance	Fast, returns stream URLs, open source	Requires self-hosting, can break with YT changes
+Invidious Instance	Well-documented API, stream URLs	Same maintenance burden as Piped
+Recommended Hybrid Approach:
+
+Use YouTube Data API v3 for search (legal, reliable metadata)
+Use self-hosted Piped to resolve video IDs → audio stream URLs
+Implement robust fallback with multiple Piped instances
+Why Not Direct YouTube API Alone: The YouTube Data API does NOT provide playable stream URLs. It only provides metadata. Every app like Musi must use some form of stream extraction, which is why they operate in a "grey area."
+
+Part 3: System Architecture
+High-Level Architecture Diagram
+┌─────────────────────────────────────────────────────────────────────┐
+│                         FLUTTER APP                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌────────────┐ │
+│  │   UI Layer  │  │  State Mgmt │  │ Audio Engine│  │  Local DB  │ │
+│  │  (Widgets)  │  │  (Riverpod) │  │ (just_audio)│  │  (Drift)   │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────┬──────┘ │
+│         │                │                │                │        │
+│         └────────────────┼────────────────┼────────────────┘        │
+│                          │                │                         │
+│                    ┌─────┴─────┐    ┌─────┴─────┐                   │
+│                    │ Repository│    │  Service  │                   │
+│                    │   Layer   │    │   Layer   │                   │
+│                    └─────┬─────┘    └─────┬─────┘                   │
+└──────────────────────────┼────────────────┼─────────────────────────┘
+                           │                │
+              ┌────────────┼────────────────┼────────────────┐
+              │            │                │                │
+              ▼            ▼                ▼                ▼
+    ┌─────────────┐ ┌────────────┐ ┌───────────────┐ ┌────────────┐
+    │  Supabase   │ │ YouTube    │ │ Piped/Proxy   │ │  Last.fm   │
+    │  (Backend)  │ │ Data API   │ │   Instance    │ │    API     │
+    │             │ │  (Search)  │ │ (Stream URLs) │ │ (Metadata) │
+    └─────────────┘ └────────────┘ └───────────────┘ └────────────┘
+Data Flow: Playing a Song
+1. User searches "Bohemian Rhapsody"
+         │
+         ▼
+2. App calls YouTube Data API v3 search endpoint
+   GET https://www.googleapis.com/youtube/v3/search?q=bohemian+rhapsody&type=video
+         │
+         ▼
+3. API returns video metadata (ID: dQw4w9WgXcQ, title, thumbnail, channel)
+         │
+         ▼
+4. User taps to play
+         │
+         ▼
+5. App calls self-hosted Piped instance
+   GET https://your-piped.domain/streams/dQw4w9WgXcQ
+         │
+         ▼
+6. Piped returns direct audio stream URL
+   { "audioStreams": [{ "url": "https://...", "quality": "128kbps", "mimeType": "audio/webm" }] }
+         │
+         ▼
+7. just_audio loads stream URL and begins playback
+         │
+         ▼
+8. Lock screen controls activated via just_audio_background
+State Management: Riverpod
+Riverpod is the recommended state management for Flutter in 2025:
+
+Why Riverpod:
+
+Compile-time safety (catches errors before runtime)
+Testability built-in
+Excellent for complex async states (loading, error, data)
+Provider composition for dependency injection
+No BuildContext dependency (works anywhere)
+State Architecture:
+
+// Core providers structure
+- authProvider           → User authentication state
+- playerProvider         → Current playback state (playing, paused, position)
+- queueProvider          → Current playlist/queue
+- nowPlayingProvider     → Currently playing track metadata
+- searchProvider         → Search results
+- libraryProvider        → User's saved playlists
+- settingsProvider       → App preferences (equalizer, crossfade, etc.)
+Part 4: Module Breakdown
+Module 1: Search & Discovery
+Components:
+
+Search input with debounce (300ms delay)
+YouTube Data API integration
+Result filtering (music videos only)
+Search history (local storage)
+Music-Only Filter Logic:
+
+YouTube search returns ALL video types. Filter using:
+
+- videoCategoryId: 10 (Music category)
+- Exclude keywords: "vlog", "tutorial", "ASMR", "podcast", "reaction"
+- Prefer: "official", "audio", "lyrics", "music video"
+- Check channel type: prefer official artist channels and Vevo
+API Quota Strategy:
+
+With 10,000 daily units and search costing 100 units:
+
+Maximum 100 searches per day per API key
+Implement aggressive caching (Redis on Supabase Edge Functions)
+Cache search results for 1 hour
+Consider multiple API keys for scaling
+Module 2: Audio Playback Engine
+Core Responsibilities:
+
+Stream URL resolution via Piped
+Buffer management (pre-load next track)
+Background playback maintenance
+Audio session handling (interruptions, routing)
+Buffer-Ahead Strategy:
+
+Track A playing: ████████████░░░░░░░░ (80% complete)
+                              │
+                              └─── Trigger: Resolve Track B stream URL
+                                   Begin buffering first 5MB of Track B
+
+Track A complete: Seamless transition to Track B (gapless)
+Audio Session Handling:
+
+Phone call interruption → Pause, resume after
+Notification sound → Duck audio briefly
+Headphone disconnect → Pause immediately
+Bluetooth device switch → Transfer playback
+Module 3: Playlist Management
+Local Storage Schema (Drift):
+
+CREATE TABLE playlists (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uuid TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  is_synced BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE tracks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  playlist_id INTEGER REFERENCES playlists(id) ON DELETE CASCADE,
+  youtube_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  artist TEXT,
+  thumbnail_url TEXT,
+  duration_seconds INTEGER,
+  position INTEGER NOT NULL,
+  added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_tracks_playlist ON tracks(playlist_id, position);
+Sync Strategy:
+
+Local-first: All operations work offline
+Background sync when online
+Conflict resolution: Last-write-wins with timestamp
+Delta sync: Only changed playlists/tracks
+Module 4: User Interface Layer
+Design System:
+
+Component	Implementation
+Color Scheme	Dynamic extraction from album art (palette_generator package)
+Motion	Hero animations for transitions, physics-based springs
+Player UI	Gesture-based (swipe up for queue, swipe down to minimize)
+Lists	Lazy loading with shimmer placeholders
+Dark Mode	System-adaptive with manual override
+Key Screens:
+
+Home: Recent plays, recommendations, quick access
+Search: Real-time results with filters
+Library: Playlists grid/list view
+Now Playing: Full-screen player with lyrics
+Queue: Drag-to-reorder, swipe-to-remove
+Module 5: Backend Services (Supabase)
+Database Schema:
+
+-- Users (handled by Supabase Auth)
+
+-- User profiles (public data)
+CREATE TABLE profiles (
+  id UUID REFERENCES auth.users PRIMARY KEY,
+  username TEXT UNIQUE,
+  display_name TEXT,
+  avatar_url TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Cloud playlists
+CREATE TABLE cloud_playlists (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  is_public BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Cloud tracks
+CREATE TABLE cloud_tracks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  playlist_id UUID REFERENCES cloud_playlists(id) ON DELETE CASCADE,
+  youtube_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  artist TEXT,
+  thumbnail_url TEXT,
+  duration_seconds INTEGER,
+  position INTEGER NOT NULL
+);
+
+-- Enable Row Level Security
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cloud_playlists ENABLE ROW LEVEL SECURITY;
+ALTER TABLE cloud_tracks ENABLE ROW LEVEL SECURITY;
+Part 5: Implementation Phases
+Phase 1: Core MVP (Weeks 1-4)
+Goal: Replicate basic Musi functionality
+
+Deliverables:
+
+[ ] Flutter project setup with folder structure
+[ ] YouTube Data API integration (search only)
+[ ] Piped instance deployment (Docker on Railway/Fly.io)
+[ ] Basic audio playback with just_audio
+[ ] Background playback with lock screen controls
+[ ] Simple playlist creation (local Drift storage)
+[ ] Minimal UI (search, results, player, library)
+Tech Setup:
+
+flutter create --org com.yourcompany project_lyra
+cd project_lyra
+
+# Core dependencies
+flutter pub add just_audio just_audio_background
+flutter pub add drift drift_flutter path_provider
+flutter pub add flutter_riverpod riverpod_annotation
+flutter pub add http dio
+flutter pub add cached_network_image
+
+# Dev dependencies  
+flutter pub add --dev build_runner drift_dev riverpod_generator
+Phase 2: Polish & Stability (Weeks 5-6)
+Goal: Production-ready core experience
+
+Deliverables:
+
+[ ] Error handling and offline states
+[ ] Stream URL fallback logic (multiple Piped instances)
+[ ] Gapless playback and crossfade
+[ ] Queue management (reorder, remove, shuffle)
+[ ] Search history and suggestions
+[ ] Music-only result filtering
+[ ] Basic settings (theme, playback preferences)
+Phase 3: User Accounts (Weeks 7-8)
+Goal: Cloud sync and persistence
+
+Deliverables:
+
+[ ] Supabase authentication (Email, Google, Apple)
+[ ] Cloud playlist sync
+[ ] Cross-device library access
+[ ] Anonymous backup via device ID (fallback)
+Phase 4: Enhancements (Weeks 9-12)
+Goal: Differentiating features
+
+Deliverables:
+
+[ ] Lyrics integration (Musixmatch API or Genius)
+[ ] 10-band software equalizer
+[ ] Volume normalization (ReplayGain-style)
+[ ] Sleep timer with volume fade
+[ ] Audio-only mode (data saver)
+[ ] Import YouTube playlists
+Phase 5: Social & Premium (Future)
+Goal: Growth and monetization
+
+Deliverables:
+
+[ ] Party Mode (WebSocket-based collaborative queue)
+[ ] Shazam integration (audio fingerprinting)
+[ ] Smart playlists (auto-discover similar tracks)
+[ ] Premium tier (ad removal, higher quality streams)
+Part 6: Infrastructure & Deployment
+Piped Instance Setup
+Option A: Railway (Recommended for MVP)
+
+# railway.toml
+[build]
+builder = "dockerfile"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 100
+Deploy from: https://github.com/TeamPiped/Piped-Docker
+
+Option B: Fly.io
+
+fly launch --image 1337kavin/piped
+fly secrets set PIPED_FRONTEND_URL=https://your-frontend.fly.dev
+Option C: Self-Hosted VPS
+
+git clone https://github.com/TeamPiped/Piped-Docker
+cd Piped-Docker
+docker-compose up -d
+API Key Security
+Never ship API keys in your app binary.
+
+Strategy:
+
+Store YouTube API key in Supabase Edge Function
+App calls your Edge Function, not YouTube directly
+Edge Function adds API key and forwards request
+Implement rate limiting per user
+// Supabase Edge Function: /functions/youtube-search
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+
+serve(async (req) => {
+  const { query } = await req.json()
+  
+  const response = await fetch(
+    `https://www.googleapis.com/youtube/v3/search?` +
+    `part=snippet&type=video&videoCategoryId=10&q=${encodeURIComponent(query)}` +
+    `&key=${Deno.env.get('YOUTUBE_API_KEY')}`
+  )
+  
+  return new Response(await response.text(), {
+    headers: { "Content-Type": "application/json" }
+  })
+})
+App Store Considerations
+iOS App Store:
+
+Ensure no download functionality
+Clearly state "streaming only" in description
+Implement proper content restrictions for minors
+Handle background audio correctly (Info.plist: UIBackgroundModes → audio)
+Google Play Store:
+
+Same streaming-only policy
+Implement foreground service for background playback
+Proper notification channel for media controls
+Target SDK requirements (currently 34+)
+Part 7: Dependency Summary
+Flutter Packages
+Package	Purpose	Version Note
+just_audio	Core audio playback	Use latest stable
+just_audio_background	Background playback & controls	Match just_audio version
+audio_session	Audio interruption handling	Required companion
+drift	Local SQLite database	Type-safe, maintained
+flutter_riverpod	State management	2.x with code generation
+dio	HTTP client	Better than http package
+cached_network_image	Image caching	For thumbnails
+palette_generator	Extract colors from images	For dynamic theming
+path_provider	File system paths	Required for drift
+supabase_flutter	Backend integration	Official SDK
+External Services
+Service	Purpose	Pricing
+Supabase	Auth, database, functions	Free tier: 50,000 MAU, 500MB DB
+YouTube Data API	Search metadata	Free: 10,000 units/day
+Railway/Fly.io	Piped hosting	~$5-10/month
+Last.fm API	Extended metadata	Free tier available
+Musixmatch	Lyrics	Free tier: 500 requests/day
+Part 8: Risk Assessment & Mitigations
+Risk 1: YouTube API Quota Exhaustion
+Mitigation:
+
+Aggressive caching (1-hour TTL for search results)
+Multiple Google Cloud projects with separate quotas
+Implement client-side search history to reduce repeated searches
+Request quota increase from Google (requires compliance audit)
+Risk 2: Piped Instance Instability
+Mitigation:
+
+Deploy multiple instances across providers
+Implement automatic failover logic
+Monitor YouTube's changes and update instances promptly
+Join Piped community for early warning of breaking changes
+Risk 3: App Store Rejection
+Mitigation:
+
+Never implement download functionality
+Clear privacy policy and terms of service
+Proper content ratings and age restrictions
+Regular compliance reviews
+Risk 4: Legal Concerns
+Mitigation:
+
+Consult with IP attorney before launch
+Implement robust DMCA takedown process
+Consider geographic restrictions if needed
+Monitor Musi's legal status as precedent
+Conclusion
+Project Lyra is technically feasible with the proposed architecture. The key to success lies in:
+
+Starting simple: MVP first with core streaming functionality
+Respecting boundaries: Stream-only, no downloads, no caching copyrighted content
+Building for scale: Architecture supports future features without rewrites
+Maintaining flexibility: Self-hosted extraction layer can be updated independently
+The Flutter + Supabase + Drift + just_audio stack provides a modern, maintainable foundation that can evolve with your product vision.
+
+Document Version: 1.0 Last Updated: December 2024 Based on 2024-2025 technology landscape analysis
