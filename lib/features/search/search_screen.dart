@@ -3,7 +3,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../core/theme/app_colors.dart';
 import '../../data/services/audio_service.dart';
-import '../../data/services/proxy_service.dart';
 import '../../models/search_result.dart';
 import '../../widgets/track_tile.dart';
 import 'search_provider.dart';
@@ -250,23 +249,13 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     );
 
     try {
-      // Get stream URL from Proxy
-      final proxyService = ref.read(proxyServiceProvider);
-      // Wait, this is synchronous
-      final streamUrl = proxyService.getStreamUrl(result.videoId);
-
-      print('[SearchScreen] Generated proxy URL: $streamUrl');
-
-      if (streamUrl.isEmpty) {
-        throw Exception('Proxy service not running');
-      }
-
-      // Play the track
+      // Play the track - AudioService handles stream resolution (Piped -> Proxy)
       final track = result.toTrack();
       await ref
           .read(audioPlayerProvider.notifier)
-          .playTrack(track, streamUrl: streamUrl);
+          .playTrack(track); // No streamUrl needed!
     } catch (e) {
+      print('[SearchScreen] Error playing track: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(

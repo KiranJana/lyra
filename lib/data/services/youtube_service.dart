@@ -97,8 +97,6 @@ class YouTubeService {
       // Fallback to highest bitrate
       selectedStream ??= audioStreams.first;
 
-      final url = selectedStream.url.toString();
-
       print(
         '[YouTubeService] Selected: ${selectedStream.container.name}, ${selectedStream.bitrate.kiloBitsPerSecond.toStringAsFixed(0)}kbps',
       );
@@ -112,30 +110,46 @@ class YouTubeService {
     }
   }
 
-  /// Get the audio stream data (bytes) for a video
-  /// Used by the local proxy server
-  Future<({Stream<List<int>> stream, int contentLength, String container})?>
-  getAudioStream(String videoId) async {
+  /// Get the audio stream info for a video
+  /// Used by the local proxy server to forward requests
+  Future<({Uri url, int contentLength, String container})?> getAudioStreamInfo(
+    String videoId,
+  ) async {
     try {
       final manifest = await _yt.videos.streamsClient.getManifest(videoId);
       final audioStreams = manifest.audioOnly.toList();
 
       if (audioStreams.isEmpty) return null;
 
+      // 1. Sort by bitrate first
       audioStreams.sort((a, b) => b.bitrate.compareTo(a.bitrate));
-      final selectedStream = audioStreams.first;
+
+      // 2. Select the best stream based on Platform
+      var selectedStream = audioStreams.first;
+
+      if (Platform.isIOS) {
+        // Find the best M4A/MP4 stream
+        final m4aStream = audioStreams.firstWhere(
+          (s) =>
+              s.container.name.toLowerCase() == 'm4a' ||
+              s.container.name.toLowerCase() == 'mp4',
+          orElse: () => audioStreams.first,
+        );
+        selectedStream = m4aStream;
+      }
 
       print(
-        '[YouTubeService] Proxy stream: ${selectedStream.container.name}, ${selectedStream.size.totalBytes} bytes',
+        '[YouTubeService] Stream info: ${selectedStream.container.name}, ${selectedStream.size.totalBytes} bytes',
       );
+      print('[YouTubeService] Stream URL: ${selectedStream.url}');
 
       return (
-        stream: _yt.videos.streamsClient.get(selectedStream),
+        url: selectedStream.url,
         contentLength: selectedStream.size.totalBytes,
         container: selectedStream.container.name,
       );
     } catch (e) {
-      print('[YouTubeService] Stream data error: $e');
+      print('[YouTubeService] Stream info error: $e');
       return null;
     }
   }

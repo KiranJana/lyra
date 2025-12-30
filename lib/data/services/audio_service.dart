@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../models/track.dart';
 import '../../models/search_result.dart';
+import 'piped_service.dart';
 
 /// Initialize audio service - must be called before runApp
 Future<void> initAudioService() async {
@@ -83,8 +84,9 @@ class AudioPlayerState {
 /// Audio player notifier - manages playback state
 class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
   final AudioPlayer _player;
+  final Ref _ref;
 
-  AudioPlayerNotifier()
+  AudioPlayerNotifier(this._ref)
     : _player = AudioPlayer(),
       super(const AudioPlayerState()) {
     _initPlayer();
@@ -154,11 +156,31 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
     await playTrack(result.toTrack());
   }
 
+  /// Internal method to resolve stream URL using Hybrid Strategy
+  /// 1. Piped (Middleware) - Preferred
+  /// 2. Proxy (Fallback)
+  Future<String?> _resolveStreamUrl(String videoId) async {
+    String? url;
+
+    // 1. Try Piped
+    try {
+      final pipedService = _ref.read(pipedServiceProvider);
+      url = await pipedService.getAudioStreamUrl(videoId);
+      if (url != null) {
+        print('[AudioService] Resolved via Piped');
+        return url;
+      }
+    } catch (e) {
+      print('[AudioService] Piped resolution failed: $e');
+    }
+
+    return null;
+  }
+
   /// Play a track
   Future<void> playTrack(Track track, {String? streamUrl}) async {
     try {
-      print('[AudioPlayer] Playing track: ${track.title}');
-      print('[AudioPlayer] Stream URL: $streamUrl');
+      print('[AudioPlayer] Request to play track: ${track.title}');
 
       state = state.copyWith(
         state: PlayerState.loading,
@@ -166,14 +188,25 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
         clearError: true,
       );
 
-      // If we have a stream URL, use it directly
-      if (streamUrl != null) {
+      // Resolve Stream URL if not provided
+      String? resolvedUrl = streamUrl;
+      if (resolvedUrl == null) {
+        resolvedUrl = await _resolveStreamUrl(track.youtubeId);
+      }
+
+      print('[AudioPlayer] Resolved URL: $resolvedUrl');
+
+      if (resolvedUrl != null) {
         print('[AudioPlayer] Setting audio source...');
-        print('[AudioPlayer] Stream URL: $streamUrl');
 
         // Local proxy handles headers internally
+        // Note: We inject Android Headers to match 'c=ANDROID' signature in Piped URLs
         final audioSource = AudioSource.uri(
-          Uri.parse(streamUrl),
+          Uri.parse(resolvedUrl),
+          headers: {
+            'User-Agent':
+                'com.google.android.youtube/17.36.36 (Linux; U; Android 12; GB) gzip',
+          },
           tag: MediaItem(
             id: track.youtubeId,
             title: track.title,
@@ -192,10 +225,10 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
         await _player.play();
         print('[AudioPlayer] Playback started!');
       } else {
-        print('[AudioPlayer] No stream URL provided');
+        print('[AudioPlayer] Failed to resolve stream URL');
         state = state.copyWith(
-          state: PlayerState.paused,
-          errorMessage: 'Stream URL resolution not yet implemented',
+          state: PlayerState.error,
+          errorMessage: 'Could not resolve audio stream',
         );
       }
     } catch (e, stackTrace) {
@@ -306,7 +339,7 @@ class AudioPlayerNotifier extends StateNotifier<AudioPlayerState> {
 /// Main audio player provider
 final audioPlayerProvider =
     StateNotifierProvider<AudioPlayerNotifier, AudioPlayerState>((ref) {
-      return AudioPlayerNotifier();
+      return AudioPlayerNotifier(ref);
     });
 
 /// Convenience providers for specific state slices

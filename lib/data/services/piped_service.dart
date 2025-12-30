@@ -224,6 +224,12 @@ class StreamInfo {
       return m4aStream.url;
     }
 
+    // 2. If no M4A, check for HLS (Native iOS format, often bypasses 403s)
+    if (hlsUrl != null) {
+      print('[StreamInfo] Selected HLS stream (Fallback)');
+      return hlsUrl;
+    }
+
     // Fall back to Opus/WebM if no M4A available
     final opusStream = audioStreams
         .where(
